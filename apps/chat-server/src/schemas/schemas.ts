@@ -6,6 +6,7 @@ export const createRoomSchema = z.object({
 
 export const joinSchema = z.object({
   roomId: z.string().min(1).max(128),
+  peerId: z.string().min(1).max(128),
 });
 
 export const signalSchema = z.object({

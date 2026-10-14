@@ -9,11 +9,14 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "glob": "^13.0.6",
     "next": "16.4.0",
+    "peerjs": "^1.5.5",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "socket.io": "^4.8.4",
-    "socket.io-client": "^4.8.4"
+    "socket.io-client": "^4.8.4",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",

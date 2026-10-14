@@ -2,7 +2,6 @@
 
 import Image from "next/image";
 import Chat from "./[roomId]/page";
-import Login from "./login/page";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 

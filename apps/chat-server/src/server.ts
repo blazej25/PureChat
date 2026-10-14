@@ -1,21 +1,37 @@
 
 import { randomBytes } from "node:crypto";
-import { createServer } from "node:http";
-import cors from "cors";
 import express from "express";
-import { Server, type Socket } from "socket.io";
+import cors from "cors";
+import { createServer } from "node:http";
+import { Server } from "socket.io";
 import { z } from "zod";
-import { createRoomSchema, joinSchema, candidateSchema, signalSchema } from "./schemas/schemas.js";
+import { PeerServer } from "peer";
+
+const PEER_PORT = Number(process.env.PEER_PORT ?? 9000);
+
+const peerServer = PeerServer({
+  port: PEER_PORT,
+  path: "/peerjs",
+});
 
 const PORT = Number(process.env.PORT ?? 4000);
 const WEB_ORIGIN =
   process.env.WEB_ORIGIN ?? "http://localhost:3000";
 
-const UNUSED_ROOM_TTL_MS = 30 * 60 * 1000;
 const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000;
+const MAX_PARTICIPANTS = 8;
+
+type RoomState = {
+  members: Map<string, string>; // Socket ID -> PeerJS ID
+  expiryTimer: ReturnType<typeof setTimeout> | null;
+};
+
+const rooms = new Map<string, RoomState>();
+const socketRoom = new Map<string, string>();
+const socketPeer = new Map<string, string>();
+const peerSocket = new Map<string, string>();
 
 const app = express();
-
 app.use(cors({ origin: WEB_ORIGIN }));
 
 const httpServer = createServer(app);
@@ -27,198 +43,177 @@ const io = new Server(httpServer, {
   },
 });
 
-// Room IDs and cleanup timers are kept only in memory.
-const rooms = new Map<string, NodeJS.Timeout | null>();
+function scheduleEmptyRoomExpiry(roomId: string): void {
+  const room = rooms.get(roomId);
+  if (!room || room.members.size > 0) return;
 
-function scheduleRoomCleanup(roomId: string, delayMs: number) {
-  const previousTimer = rooms.get(roomId);
-
-  if (previousTimer) {
-    clearTimeout(previousTimer);
+  if (room.expiryTimer) {
+    clearTimeout(room.expiryTimer);
   }
 
-  const timer = setTimeout(() => {
-    const members = io.sockets.adapter.rooms.get(roomId);
+  room.expiryTimer = setTimeout(() => {
+    const current = rooms.get(roomId);
 
-    if (!members || members.size === 0) {
+    if (current && current.members.size === 0) {
       rooms.delete(roomId);
       console.log(`Room expired: ${roomId}`);
-    } else {
-      rooms.set(roomId, null);
     }
-  }, delayMs);
+  }, EMPTY_ROOM_TTL_MS);
 
-  timer.unref();
-  rooms.set(roomId, timer);
+  room.expiryTimer.unref?.();
 }
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// Create a room and return its shareable ID.
 app.post("/api/rooms", (_req, res) => {
   const roomId = randomBytes(16).toString("base64url");
 
-  rooms.set(roomId, null);
-  scheduleRoomCleanup(roomId, UNUSED_ROOM_TTL_MS);
+  rooms.set(roomId, {
+    members: new Map(),
+    expiryTimer: null,
+  });
+
+  scheduleEmptyRoomExpiry(roomId);
 
   res.status(201).json({ roomId });
 });
 
+app.post("/api/rooms/:roomId", (_req, res) => {
+  const { roomId } = _req.params;
+  const room = rooms.get(roomId);
 
-app.post("/api/rooms/:roomId", (req, res) => {
-  const parsed = createRoomSchema.safeParse(req.params);
+  if (!room) {
+    rooms.set(roomId, {
+        members: new Map(),
+        expiryTimer: null,
+    });
 
-  if (!parsed.success) {
-    res.status(400).json({ message: "Invalid room ID." });
+    scheduleEmptyRoomExpiry(roomId);
+    res.status(200).json({ roomId });
+
     return;
   }
 
-  const { roomId } = parsed.data;
-
-  if (rooms.has(roomId)) {
-    console.log(`Room already exists: ${roomId}`);
-    res.status(200).json({ message: "Room already exists." });
-    return;
-  }
-
-  rooms.set(roomId, null);
-  scheduleRoomCleanup(roomId, UNUSED_ROOM_TTL_MS);
-
-console.log(`Room created: ${roomId}`);
-  res.status(201).json({ roomId });
+  res.status(200).json({ roomId });
 });
 
-function canSignal(
-  socket: Socket,
-  roomId: string,
-  targetId: string,
-): boolean {
-  const members = io.sockets.adapter.rooms.get(roomId);
-
-  return (
-    socket.rooms.has(roomId) &&
-    members?.has(targetId) === true
-  );
-}
+const joinSchema = z.object({
+  roomId: z.string().min(1).max(128),
+  peerId: z.string().min(1).max(128),
+});
 
 io.on("connection", (socket) => {
-  console.log(`Connected: ${socket.id}`);
-
   socket.on("room:join", (payload: unknown) => {
-    console.log(`Join request from ${socket.id}:`, payload);
     const parsed = joinSchema.safeParse(payload);
 
     if (!parsed.success) {
       socket.emit("room:error", {
-        message: "Invalid room ID.",
+        message: "Invalid room or peer ID.",
       });
       return;
     }
 
-    const { roomId } = parsed.data;
+    const { roomId, peerId } = parsed.data;
+    const room = rooms.get(roomId);
 
-    if (!rooms.has(roomId)) {
+    if (!room) {
       socket.emit("room:error", {
         message: "Room does not exist or has expired.",
       });
       return;
     }
 
-    const members = io.sockets.adapter.rooms.get(roomId);
-    const peers = [...(members ?? [])].filter(
-      (peerId) => peerId !== socket.id,
-    );
-
-    if (!socket.rooms.has(roomId)) {
-      const timer = rooms.get(roomId);
-
-      if (timer) {
-        clearTimeout(timer);
-      }
-
-      rooms.set(roomId, null);
-      socket.join(roomId);
-
-      // Notify existing peers about the newcomer.
-      socket.to(roomId).emit("peer:joined", {
-        roomId,
-        peerId: socket.id,
+    if (socketRoom.has(socket.id)) {
+      socket.emit("room:error", {
+        message: "This connection has already joined a room.",
       });
+      return;
     }
 
-    // The joining client can establish WebRTC connections
-    // with these existing peers.
+    const existingOwner = peerSocket.get(peerId);
+
+    if (existingOwner && existingOwner !== socket.id) {
+      socket.emit("room:error", {
+        message: "That peer ID is already registered.",
+      });
+      return;
+    }
+
+    if (room.members.size >= MAX_PARTICIPANTS) {
+      socket.emit("room:error", {
+        message: "Room is full.",
+      });
+      return;
+    }
+
+    // Capture the existing members before adding the newcomer.
+    const peers = [...room.members.values()];
+
+    if (room.expiryTimer) {
+      clearTimeout(room.expiryTimer);
+      room.expiryTimer = null;
+    }
+
+    room.members.set(socket.id, peerId);
+    socketRoom.set(socket.id, roomId);
+    socketPeer.set(socket.id, peerId);
+    peerSocket.set(peerId, socket.id);
+
+    socket.join(roomId);
+
     socket.emit("room:peers", {
       roomId,
       peers,
     });
-  });
 
-  socket.on("webrtc:offer", (payload: unknown) => {
-    const parsed = signalSchema.safeParse(payload);
-
-    if (!parsed.success) return;
-
-    const { roomId, targetId, description } = parsed.data;
-
-    if (!canSignal(socket, roomId, targetId)) return;
-
-    io.to(targetId).emit("webrtc:offer", {
+    socket.to(roomId).emit("peer:joined", {
       roomId,
-      from: socket.id,
-      description,
-    });
-  });
-
-  socket.on("webrtc:answer", (payload: unknown) => {
-    const parsed = signalSchema.safeParse(payload);
-
-    if (!parsed.success) return;
-
-    const { roomId, targetId, description } = parsed.data;
-
-    if (!canSignal(socket, roomId, targetId)) return;
-
-    io.to(targetId).emit("webrtc:answer", {
-      roomId,
-      from: socket.id,
-      description,
-    });
-  });
-
-  socket.on("webrtc:ice-candidate", (payload: unknown) => {
-    const parsed = candidateSchema.safeParse(payload);
-
-    if (!parsed.success) return;
-
-    const { roomId, targetId, candidate } = parsed.data;
-
-    if (!canSignal(socket, roomId, targetId)) return;
-
-    io.to(targetId).emit("webrtc:ice-candidate", {
-      roomId,
-      from: socket.id,
-      candidate,
+      peerId,
     });
   });
 
   socket.on("disconnecting", () => {
-    for (const roomId of socket.rooms) {
-      const members = io.sockets.adapter.rooms.get(roomId);
+    const roomId = socketRoom.get(socket.id);
+    const peerId = socketPeer.get(socket.id);
 
-      if (rooms.has(roomId) && members?.size === 1) {
-        scheduleRoomCleanup(roomId, EMPTY_ROOM_TTL_MS);
+    if (!roomId || !peerId) return;
+
+    const room = rooms.get(roomId);
+
+    if (room) {
+      room.members.delete(socket.id);
+
+      socket.to(roomId).emit("peer:left", {
+        roomId,
+        peerId,
+      });
+
+      if (room.members.size === 0) {
+        scheduleEmptyRoomExpiry(roomId);
       }
     }
-  });
 
-  socket.on("disconnect", () => {
-    console.log(`Disconnected: ${socket.id}`);
+    if (peerSocket.get(peerId) === socket.id) {
+      peerSocket.delete(peerId);
+    }
+
+    socketRoom.delete(socket.id);
+    socketPeer.delete(socket.id);
   });
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`Signaling server listening on port ${PORT}`);
+  console.log(`Application server listening on port ${PORT}`);
 });
+
+// PeerJS server listens on a different port
+peerServer.on("connection", (client) => {
+  console.log(`PeerJS client connected: ${client.getId()}`);
+});
+
+peerServer.on("disconnect", (client) => {
+  console.log(`PeerJS client disconnected: ${client.getId()}`);
+});
+
